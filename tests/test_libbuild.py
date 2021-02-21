@@ -1,8 +1,8 @@
 "Test cli_build."""
-
-from idpconfgen.cli_build import *
-
+import numpy as np
 import pytest
+
+from idpconfgen.libs.libbuild import init_confmasks
 
 
 def test_conf_masks():
