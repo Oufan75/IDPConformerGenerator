@@ -9,6 +9,8 @@ __pycache__/
 # test files
 src/idpconfgen/cli_build_old.py
 src/idpconfgen/drk_bond_len.py
+src/idpconfgen/core/data/*bgeo*
+
 
 # vim and project files
 *.swp
