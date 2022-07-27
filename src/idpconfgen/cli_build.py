@@ -590,19 +590,9 @@ def conformer_generator(
                     all_atom_coords[ALL_ATOM_MASKS.Hterm, :] = current_Hterm_coords
 
             # TODO:mark last built atom to avoid recalculating old energies
-            if energy_threshold: total_energy = ALL_ATOM_EFUNC(all_atom_coords)
-            # pdb checkpoints
-            if False:
-                res_idx = np.argwhere(ALL_ATOM_LABELS.res_nums == current_res_number + 1).max()
-                pdb_checkpoint(all_atom_seq_3l[:current_res_number+1],
-                               ALL_ATOM_LABELS.atom_labels[:res_idx+1],
-                               ALL_ATOM_LABELS.res_nums[:res_idx+1],
-                               all_atom_coords[:res_idx+1],
-                               nstep, dirname='torsions/alpha_syn/rebuilds_checkpt')
+            total_energy = ALL_ATOM_EFUNC(all_atom_coords)        
             
-            
-            if energy_threshold and np.any(total_energy>energy_threshold):
-                #if nstep > 2000: return #for rebuilding conformers
+            if np.any(total_energy>energy_threshold):
                 try:
                     if same_res_try < res_try_limit:
                         same_res_try += 1
