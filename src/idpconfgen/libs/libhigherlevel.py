@@ -650,7 +650,7 @@ def read_trimer_torsion_planar_angles(pdb, bond_geometry):
             'PDB does not start with N. '
             f'{s.data_array[0, col_name]} instead.'
             )
-
+    #print(s.data_array[20])
     bb_minimal_names = s.filtered_atoms[:, col_name]
     bb_residue_names = s.filtered_atoms[:, col_resName]
 

@@ -121,6 +121,7 @@ class Structure:
             The data in PDB format after filtering.
         """
         apply_filter = _APPLY_FILTER
+        #print(apply_filter)
         return np.array(list(reduce(
             apply_filter,
             self.filters,

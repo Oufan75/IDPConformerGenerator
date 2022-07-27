@@ -370,9 +370,8 @@ def translate_seq_to_3l(input_seq):
 
     Currently translates 'H' to 'HIP', to accommodate double protonation.
     """
-    return [
-        'HIP' if _res == 'H' else aa1to3[_res]
-        for _res in input_seq
+    return ['HIP' if _res == 'H' else 
+            aa1to3[_res] for _res in input_seq
         ]
 
 

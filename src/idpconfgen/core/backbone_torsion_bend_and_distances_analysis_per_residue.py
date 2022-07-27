@@ -59,7 +59,7 @@ def calculate_angle(pdb):
     d4 = NORM(C_O)
 
     for residue in aa3to1.keys():
-
+        if residue in ['VAL', 'CYS', 'HIS', 'HIE', 'HID']: continue
         N_mask = fa[:, col_name] == 'N'
         mask = fa[N_mask, col_resName] == residue
 
@@ -84,7 +84,7 @@ def calculate_angle(pdb):
 
 pdbs = sys.argv[1] #Path('ssplit')
 bbatoms = {'N', 'CA', 'C', 'O'}
-pdb_files = read_path_bundle([pdbs]) #2* [Path(sys.argv[1])] #list(pdbs.glob('*.pdb'))
+pdb_files = read_path_bundle([pdbs], ext='.pdb') #2* [Path(sys.argv[1])] #list(pdbs.glob('*.pdb'))
 #print(pdb_files)
 
 

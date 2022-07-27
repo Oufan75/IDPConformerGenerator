@@ -4,7 +4,6 @@ from collections import defaultdict
 from copy import copy
 from math import pi
 from pathlib import Path
-from pprint import pprint
 from statistics import mean, stdev
 
 import numpy as np
@@ -118,7 +117,6 @@ def read_ff14SB_params():
                 for atom in filter(lambda x: x.tag == 'Atom', residue):
                     key = residue.attrib['name']
                     atom_name = atom.attrib['name']
-
                     atom_par = ff14SB_params[key].setdefault(atom_name, {})
                     atom_par.update(atom.attrib)
                     ff14SB_params[key][atom_name].pop('name')
@@ -130,9 +128,40 @@ def read_ff14SB_params():
                     key = atom.attrib['type']
                     ff14SB_params[key].update(atom.attrib)
                     ff14SB_params[key].pop('type')
-
+        # extract parameters for torsional energy, 
+        # for compatibility with sidechainnet in IDP calculations 
+        # by oz 4/2/2022
+        elif child.tag == 'PeriodicTorsionForce':
+            for pp in child:
+                if pp.tag == 'Proper':
+                    key = format_tortype([pp.attrib['type1'], pp.attrib['type2'], 
+                                          pp.attrib['type3'], pp.attrib['type4']]) 
+                    ff14SB_params[key] = {'k': [], 'phase': [], 'period': []}
+                    if 'k1' in pp.attrib:
+                        ff14SB_params[key]['k'].append(float(pp.attrib['k1']))
+                        ff14SB_params[key]['phase'].append(float(pp.attrib['phase1']))
+                        ff14SB_params[key]['period'].append(float(pp.attrib['periodicity1'])) 
+                    if 'k2' in pp.attrib:
+                        ff14SB_params[key]['k'].append(float(pp.attrib['k2']))
+                        ff14SB_params[key]['phase'].append(float(pp.attrib['phase2']))
+                        ff14SB_params[key]['period'].append(float(pp.attrib['periodicity2']))
+                    if 'k3' in pp.attrib:
+                        ff14SB_params[key]['k'].append(float(pp.attrib['k3']))
+                        ff14SB_params[key]['phase'].append(float(pp.attrib['phase3']))
+                        ff14SB_params[key]['period'].append(float(pp.attrib['periodicity3']))
+                    if 'k4' in pp.attrib:
+                        ff14SB_params[key]['k'].append(float(pp.attrib['k4']))
+                        ff14SB_params[key]['phase'].append(float(pp.attrib['phase4']))
+                        ff14SB_params[key]['period'].append(float(pp.attrib['periodicity4']))
     return ff14SB_params
 
+def format_tortype(tors):
+    # format torsion type consistent with sidechainnnet
+    assert len(tors) == 4
+    # remove protein-
+    tors = ['  ' if t=='' else t[8:] for t in tors]
+    newtors = [t+' ' if len(t)<2 else t for t in tors]
+    return '-'.join(t for t in newtors)
 
 def generate_residue_template_topology(
         pdb_files,
@@ -565,11 +594,6 @@ bend_angles_N_CA_C = {
     'V': 4310842035620741 / 2251799813685248,  # 1.914 0.04
     }
 
-build_bend_angles_N_CA_C = {
-    key: (pi - v) / 2
-    for key, v in bend_angles_N_CA_C.items()
-    }
-
 bend_angles_CA_C_Np1 = {
     'A': 4588994859787807 / 2251799813685248,  # 2.038 0.022
     'R': 4588049090836895 / 2251799813685248,  # 2.038 0.022
@@ -593,11 +617,6 @@ bend_angles_CA_C_Np1 = {
     'V': 4584841207534447 / 2251799813685248,  # 2.036 0.021
     }
 
-build_bend_angles_CA_C_Np1 = {
-    key: (pi - v) / 2
-    for key, v in bend_angles_CA_C_Np1.items()
-    }
-
 bend_angles_Cm1_N_CA = {
     'A': 4768579151967919 / 2251799813685248,  # 2.118 0.028
     'R': 1192445900065887 / 562949953421312,   # 2.118 0.028
@@ -619,6 +638,16 @@ bend_angles_Cm1_N_CA = {
     'W': 4773546458813579 / 2251799813685248,  # 2.12 0.032
     'Y': 4773380997634081 / 2251799813685248,  # 2.12 0.031
     'V': 596711317736503 / 281474976710656,    # 2.12 0.029
+    }
+
+build_bend_angles_N_CA_C = {
+    key: (pi - v) / 2
+    for key, v in bend_angles_N_CA_C.items()
+    }
+
+build_bend_angles_CA_C_Np1 = {
+    key: (pi - v) / 2
+    for key, v in bend_angles_CA_C_Np1.items()
     }
 
 build_bend_angles_Cm1_N_CA = {
@@ -675,9 +704,9 @@ distances_CA_C = {
     'Y': 6859340134216747 / 4503599627370496,  # 1.523 0.012
     'V': 6867874764281747 / 4503599627370496,  # 1.525 0.012
     }
-
 average_distance_CA_C = mean(distances_CA_C.values())
 std_distance_CA_C = stdev(distances_CA_C.values())
+
 
 distances_C_Np1 = {
     'A': 5993805121385571 / 4503599627370496,  # 1.331 0.01
@@ -701,14 +730,34 @@ distances_C_Np1 = {
     'Y': 2996393655695127 / 2251799813685248,  # 1.331 0.009
     'V': 2996598670315555 / 2251799813685248,  # 1.331 0.009
     }
-
 average_distance_C_Np1 = mean(distances_C_Np1.values())
 std_distance_C_Np1 = stdev(distances_C_Np1.values())
 
 build_bend_CA_C_OXT = (pi - (2 * pi / 3)) / 2
-build_bend_CA_C_O = 2.102 / 2
+bend_CA_C_O = {
+ 'A': (1.0541758889353119, 0.0069842997135667806),
+ 'R': (1.0546809893162123, 0.007549234066266165),
+ 'N': (1.055006006997733, 0.0073383375319508075),
+ 'D': (1.0525346214777556, 0.009315601458348114),
+ 'E': (1.0550030467187501, 0.006964542586128861),
+ 'Q': (1.054151967049067, 0.007248438018385094),
+ 'G': (1.0522988681010852, 0.005954747574622742),
+ 'H': (1.054676960841019, 0.007818311778806757),
+ 'I': (1.0550377771457777, 0.008702079869040742),
+ 'L': (1.055252797697554, 0.006983091305293881),
+ 'K': (1.0550068814322462, 0.007395075977513027),
+ 'M': (1.0540383110293772, 0.007083012489148418),
+ 'F': (1.0550556005625855, 0.007198217946333693),
+ 'P': (1.055669028104654, 0.004919914048055132),
+ 'S': (1.0548788119697963, 0.006894776734509817),
+ 'T': (1.056363369321596, 0.007440837034478803),
+ 'W': (1.0547201087091373, 0.007315650499584992),
+ 'Y': (1.0552541252945091, 0.007363659428102974),
+ 'C': (1.051, 0.007),
+ 'V': (1.051, 0.007)}
 distance_C_OXT = 1.27
 distance_C_O = 5556993099130213 / 4503599627370496
+
 
 # NH atom:
 distance_H_N = 0.9

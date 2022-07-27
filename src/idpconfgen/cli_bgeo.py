@@ -116,7 +116,7 @@ def main(pdb_files, convert=False, func=None):
     bond_geo_db = defaultdict(dict)
 
     for pdb_path, pdb_bites in pdbs:
-        log.info(S(f'Reading... {pdb_path.stem}'))
+        #log.info(S(f'Reading... {pdb_path.stem}'))
         try:
             read_trimer_torsion_planar_angles(pdb_bites, bond_geo_db)
         except PDBFormatError as err:

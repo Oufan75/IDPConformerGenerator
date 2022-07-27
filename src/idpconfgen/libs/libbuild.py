@@ -14,20 +14,30 @@ from idpconfgen import log
 from idpconfgen.core.build_definitions import (
     bonds_equal_3_inter,
     bonds_le_2_inter,
+    bonds_equal_1_inter,
     distances_C_Np1,
     distances_CA_C,
     distances_N_CA,
+    build_bend_angles_Cm1_N_CA,
+    build_bend_angles_N_CA_C, 
+    build_bend_angles_CA_C_Np1,
+    #sidechain_bond_lengths,
+    sidechain_templates,
+    atom_names_pdb,
     )
 from idpconfgen.core.definitions import (
     bgeo_CaCNp1,
     bgeo_Cm1NCa,
     bgeo_NCaC,
     faspr_dun2010bbdep_path,
+    vdW_radii_tsai_1999,
+    aa3to1
     )
 from idpconfgen.libs.libcalc import (
     calc_all_vs_all_dists_njit,
     multiply_upper_diagonal_raw_njit,
     sum_upper_diagonal_raw_njit,
+    get_methylene_hydrogens
     )
 from idpconfgen.libs.libenergyij import (
     default_post_calc_option,
@@ -44,6 +54,10 @@ from idpconfgen.libs.libio import read_dictionary_from_disk
 from idpconfgen.libs.libparse import (
     get_mers,
     translate_seq_to_3l,
+    )
+from idpconfgen.libs.libcalc import (
+    calc_torsion_angles,
+    rotate_coordinates_Q_njit,
     )
 from idpconfgen.libs.libtimer import ProgressCounter, timeme
 
@@ -90,6 +104,238 @@ atom_labels
 res_nums
 res_labels
 """
+
+def rotate_tor(original_tor, tor, unit_vector, coords, offset):
+    """
+    
+
+    Parameters
+    ----------
+    original_tor : np.float
+        original torsion angle in template.
+    tor : np.float
+        target torsion angle.
+    unit_vector : numpy nd.array, shape (3, ), dtype=float64
+        Unitary vector of the axis to rotate around.
+    coords : numpy nd.array, shape (N, 3), dtype=float64
+        Sidechain coordinates to rotate.
+    offset : numpy nd.array, shape (3, ), dtype=float64
+        Coordinate of the atom at rotation axis.
+
+    Returns
+    -------
+    Rotated coordinates.
+
+    """   
+    displaced = coords - offset
+
+    # rotate
+    rot_angle = original_tor - tor
+    if rot_angle > np.pi:
+            rot_angle -= 2*np.pi
+    elif rot_angle < -np.pi:
+            rot_angle += 2*np.pi
+    rotated = rotate_coordinates_Q_njit(displaced, -unit_vector, rot_angle)
+    
+    return rotated + offset
+    
+
+def rotate_sidechain(res_type, tors):
+    """
+
+    Parameters
+    ----------
+    res_type : str 
+        one letter coding of amino acid
+    tors : numpy nd.array, shape (M, ), dtype=float64
+        M depends on res_type, each angle [-pi, pi]
+        Generated chi torsion angles.
+
+    Returns
+    -------
+    Rotated sidechain coordinates
+
+    """
+    assert not res_type in ['ALA', 'GLY']
+    # fetch side chain template
+    template, sidechain_idx = sidechain_templates[res_type]
+    # fetch side chain atom labels
+    sidechain_label = np.asarray(atom_names_pdb[res_type])
+    #print(res_type)
+    
+    # chi1 angles in template
+    if res_type == 'SER':
+        N_CA_CB_CG = [np.where(sidechain_label=='N')[0][0], 
+                               np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='OG')[0][0]]
+    elif res_type == 'THR':
+        N_CA_CB_CG = [np.where(sidechain_label=='N')[0][0], 
+                               np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='OG1')[0][0]]
+    elif res_type in ['ILE', 'VAL']:
+        N_CA_CB_CG = [np.where(sidechain_label=='N')[0][0], 
+                               np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG1')[0][0]]
+    elif res_type == "CYS":
+        N_CA_CB_CG = [np.where(sidechain_label=='N')[0][0], 
+                               np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='SG')[0][0]]
+    else:
+        N_CA_CB_CG = [np.where(sidechain_label=='N')[0][0], 
+                               np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0]]
+    ori_chi1 = calc_torsion_angles(template[N_CA_CB_CG, :])[0]
+    
+    # chi2 angles in template
+    if res_type == 'MET':       
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='SD')[0][0]]
+        CB_CG_CD_CE = [np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='SD')[0][0],
+                               np.where(sidechain_label=='CE')[0][0]]
+    elif res_type == 'ILE':
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG1')[0][0],
+                               np.where(sidechain_label=='CD1')[0][0]] 
+    elif res_type in ['HIS', 'HIP', 'HID', 'HIE']:
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='ND1')[0][0]]
+    elif res_type in [ 'ASN', 'ASP']:
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='OD1')[0][0]]
+    elif res_type in ['TRP', 'PHE', 'LEU', 'TYR']:
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD1')[0][0]]
+    elif res_type not in ['SER', 'THR', 'VAL', 'CYS']:
+        CA_CB_CG_CD = [np.where(sidechain_label=='CA')[0][0],
+                               np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0]]
+    
+    # rest of residues
+    if res_type in ['GLN','GLU']:
+        CB_CG_CD_CE = [np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='OE1')[0][0]]
+    elif res_type == 'LYS':
+        CB_CG_CD_CE = [np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='CE')[0][0]]
+        CG_CD_CE_CZ = [np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='CE')[0][0],
+                               np.where(sidechain_label=='NZ')[0][0]]
+    elif res_type == 'ARG':
+        CB_CG_CD_CE = [np.where(sidechain_label=='CB')[0][0],
+                               np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='NE')[0][0]]
+        CG_CD_CE_CZ = [np.where(sidechain_label=='CG')[0][0],
+                               np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='NE')[0][0],
+                               np.where(sidechain_label=='CZ')[0][0]]
+        CD_NE_CZ_NH1 = [np.where(sidechain_label=='CD')[0][0],
+                               np.where(sidechain_label=='NE')[0][0],
+                               np.where(sidechain_label=='CZ')[0][0],
+                               np.where(sidechain_label=='NH1')[0][0]]
+        ori_chi5 = calc_torsion_angles(template[CD_NE_CZ_NH1, :])[0]
+        
+    # sample sidechain bond lengths
+    #res_type_1l = 'H' if aa3to1[res_type]=='p' else aa3to1[res_type]
+    #bond_stats = sidechain_bond_lengths[res_type_1l]
+    
+    # place CB at origin for rotation, exclude bb atoms and HA
+    CB = template[np.where(sidechain_label=='CB')[0][0]]
+    unit_vector = CB/np.linalg.norm(CB)
+    HA = np.where(sidechain_label=='HA')[0][0]
+    chi1_idx = np.delete(sidechain_idx, np.where(sidechain_idx==HA)[0][0])
+    template[chi1_idx, :] = rotate_tor(ori_chi1, tors[0], unit_vector, 
+                                             template[chi1_idx, :], CB)
+    # stretch bonds
+    #CA_CB_len = np.random.normal(bond_stats['CA_CB'][0], bond_stats['CA_CB'][1])
+    #template[chi1_idx, :] = change_bond_length(template[chi1_idx, :],
+    #                                           CA_CB_len, CB)
+    if len(tors) == 1:
+        return template, sidechain_idx
+    
+    ori_chi2 = calc_torsion_angles(template[CA_CB_CG_CD, :])[0]
+    CGs = template[5]
+    assert sidechain_label[5] in ['CG','CG1']
+    unit_vector = (CGs - CB)/np.linalg.norm(CGs - CB)
+    HBs = np.where(np.isin(sidechain_label, ['HB','2HB','1HB','CB', 'CG2',
+                                             '1HG2', '2HG2', '3HG2']))[0]
+    chi2_idx = np.delete(chi1_idx, np.where(np.isin(chi1_idx, HBs))[0])
+    template[chi2_idx, :] = rotate_tor(ori_chi2, tors[1], unit_vector, 
+                                             template[chi2_idx, :], CGs)
+    # stretch bonds
+    #CB_CG_len = np.random.normal(bond_stats['CB_CGs'][0], bond_stats['CB_CGs'][1])
+    #template[chi2_idx, :] = change_bond_length(template[chi2_idx, :],
+    #                                           CB_CG_len, (CGs-CB))
+    if res_type == 'PRO':
+        template[-2:, :] = get_methylene_hydrogens(template[5], template[6], template[0]) 
+    if len(tors) == 2:
+        return template, sidechain_idx
+    
+    ori_chi3 = calc_torsion_angles(template[CB_CG_CD_CE, :])[0]
+    CDs = template[6]
+    assert sidechain_label[6] in ['CD','SD']
+    unit_vector = (CDs - CGs)/np.linalg.norm(CDs - CGs)
+    HGs = np.where(np.isin(sidechain_label, ['HG','1HG','2HG','CG','CG1']))[0]
+    chi3_idx = np.delete(chi2_idx, np.where(np.isin(chi2_idx, HGs))[0])
+    template[chi3_idx, :] = rotate_tor(ori_chi3, tors[2], unit_vector, 
+                                             template[chi3_idx, :], CDs)
+    # stretch bonds
+    #CG_CD_len = np.random.normal(bond_stats['CGs_CDs'][0], bond_stats['CGs_CDs'][1])
+    #template[chi3_idx, :] = change_bond_length(template[chi3_idx, :], 
+    #                                           CG_CD_len, CDs-CGs)
+    if len(tors) == 3:
+        #print('rotated chi3:', np.degrees(calc_torsion_angles(template[CB_CG_CD_CE, :])[0]))
+        return template, sidechain_idx
+    
+    ori_chi4 = calc_torsion_angles(template[CG_CD_CE_CZ, :])[0]
+    CEs = template[7]
+    assert sidechain_label[7] in ['NE','CE']
+    unit_vector = (CEs - CDs)/np.linalg.norm(CEs - CDs)
+    HDs = np.where(np.isin(sidechain_label, ['HD','1HD','2HD','CD','SD']))[0]
+    chi4_idx = np.delete(chi3_idx, np.where(np.isin(chi3_idx, HDs))[0])
+    template[chi4_idx, :] = rotate_tor(ori_chi4, tors[3], unit_vector, 
+                                             template[chi4_idx, :], CEs)
+    # stretch bonds
+    #CD_CE_len = np.random.normal(bond_stats['CDs_CE'][0], bond_stats['CDs_CE'][1])
+    #template[chi4_idx, :] = change_bond_length(template[chi4_idx, :],
+    #                                           CD_CE_len, CEs-CDs)
+    if len(tors) == 4:
+        return template, sidechain_idx
+    
+    CZ = template[8]
+    unit_vector = (CZ - CEs)/np.linalg.norm(CZ - CEs)
+    assert sidechain_label[19] == 'HE'
+    chi5_idx = np.delete(chi4_idx, np.where(np.isin(chi4_idx, [19, 7]))[0])
+    template[chi5_idx, :] = rotate_tor(ori_chi5, tors[4], unit_vector, 
+                                             template[chi5_idx, :], CZ)
+    # stretch bonds
+    #NE_CZ_len = np.random.normal(bond_stats['NE_CZ'][0], bond_stats['NE_CZ'][1])
+    #template[chi5_idx, :] = change_bond_length(template[chi5_idx, :],
+    #                                           NE_CZ_len, CZ-CEs)
+    return template, sidechain_idx
+
 
 
 def build_regex_substitutions(
@@ -289,7 +535,7 @@ def create_conformer_labels(
     # considers sidechain all-atoms
     atom_labels = np.array(
         make_list_atom_labels(
-            input_seq,
+            input_seq_3_letters,
             atom_names_definition,
             )
         )
@@ -438,15 +684,15 @@ def get_cycle_distances_backbone():
 
 
 # deactivated after using bend library BGEO
-# def get_cycle_bend_angles():
-#     """
-#     Return an infinite iterator of the bend angles.
-#     """
-#     return cycle((
-#         build_bend_angles_Cm1_N_CA,  # used for OMEGA
-#         build_bend_angles_N_CA_C,  # used for PHI
-#         build_bend_angles_CA_C_Np1,  # used for PSI
-#         ))
+def get_cycle_bend_angles():
+     """
+     Return an infinite iterator of the bend angles.
+     """
+     return cycle((
+         build_bend_angles_Cm1_N_CA,  # used for OMEGA
+         build_bend_angles_N_CA_C,  # used for PHI
+         build_bend_angles_CA_C_Np1,  # used for PSI
+         ))
 
 
 def get_cycle_bond_type():
@@ -463,26 +709,6 @@ def get_cycle_bond_type():
         ))
 
 
-#def read_db_to_slices(database, dssp_regexes, ncores=1):
-#    """Create database base of slice and angles."""
-#    # reads db dictionary from disk
-#    db = read_dictionary_from_disk(database)
-#    log.info(f'Read DB with {len(db)} entries')
-#
-#    # reads and prepares IDPConfGen data base
-#    timed = partial(timeme, aligndb)
-#    pdbs, angles, dssp, resseq = timed(db)
-#
-#    # searchs for slices in secondary structure, according to user requests
-#    timed = partial(timeme, regex_search, ncores=ncores)
-#    dssp_regexes = \
-#        [dssp_regexes] if isinstance(dssp_regexes, str) else dssp_regexes
-#    slices = []
-#    for dssp_regex_string in dssp_regexes:
-#        slices.extend(timed(dssp, dssp_regex_string))
-#    log.info(f'Found {len(slices)} indexes for {dssp_regexes}')
-#
-#    return slices, angles
 
 
 def read_db_to_slices_given_secondary_structure(database, ss_regexes):
@@ -665,6 +891,7 @@ def prepare_energy_function(
         residue_labels,
         forcefield,
         lj_term=True,
+        clash_term=True,
         coulomb_term=False,
         energy_type_ij=default_post_calc_option,
         **kwnull,
@@ -681,6 +908,15 @@ def prepare_energy_function(
     energy_type_ij : str
         How to calculate the energy for `ij` pairs. See
         `libs.libenergyij.post_calc_options`.
+     
+    bonds_1_mask = create_bonds_apart_mask_for_ij_pairs(
+        atom_labels,
+        residue_numbers,
+        residue_labels,
+        forcefield.res_topology,
+        bonds_equal_1_inter,
+        base_bool=False,
+        )
     """
     # this mask identifies covalently bonded pairs and pairs two bonds apart
     bonds_le_2_mask = create_bonds_apart_mask_for_ij_pairs(
@@ -720,7 +956,7 @@ def prepare_energy_function(
         bcoeff[bonds_exact_3_mask] *= _lj14scale * 0.2
         acoeff[bonds_le_2_mask] = np.nan
         bcoeff[bonds_le_2_mask] = np.nan
-
+        
         lf_calc = init_lennard_jones_calculator(
             acoeff,
             bcoeff,
@@ -744,14 +980,43 @@ def prepare_energy_function(
         coulomb_calc = init_coulomb_calculator(charges_ij, postf=energy_type_ij)
         energy_func_terms.append(coulomb_calc)
         log.info('prepared Coulomb')
-
+    
+    if clash_term:
+        vdw_radii_sum = calc_vdw_radii_sum(atom_labels)
+        #hmask = hydrogen_bond_mask(vdw_radii_sum)
+        vdw_radii_sum *= 0.6 #clash check paramerter as defined in SI of MCSCE
+        #vdw_radii_sum[hmask] *= 0.8
+        vdw_radii_sum[bonds_le_2_mask] = 0
+        #vdw_radii_sum = vdw_radii_sum[None]
+    else:
+        vdw_radii_sum = None
     # in case there are iji terms, I need to add here another layer
     calc_energy = energycalculator_ij(
         calc_all_vs_all_dists_njit,
         energy_func_terms,
+        check_clash=clash_term,
+        vdw_radii_sum=vdw_radii_sum
         )
     log.info('done preparing energy func')
     return calc_energy
+
+
+def hydrogen_bond_mask(vdw_radii_sum):
+    OH_radii = vdW_radii_tsai_1999['H'] + vdW_radii_tsai_1999['O']
+    return vdw_radii_sum == OH_radii
+
+def calc_vdw_radii_sum(atom_labels):
+    """
+    Calculate the van der Waals radii sum for atom pairs as for checking whether there are structure clashes
+    
+    prev: previously calculated atom numbers
+    """
+    atom_types = [a[0] for a in atom_labels]
+    vdw_radii = [vdW_radii_tsai_1999[a] for a in atom_types]
+    num_ij_pairs = len(atom_labels)*(len(atom_labels)-1)//2 
+    vdw_radii_sum_ij = np.empty(num_ij_pairs, dtype=np.float64)
+    sum_upper_diagonal_raw_njit(vdw_radii, vdw_radii_sum_ij)
+    return vdw_radii_sum_ij
 
 
 def create_bonds_apart_mask_for_ij_pairs(
@@ -921,7 +1186,6 @@ def create_LJ_params_raw(
 
     acoeff = 4 * epsilons_ij * (sigmas_ij ** 12)
     bcoeff = 4 * epsilons_ij * (sigmas_ij ** 6)
-
     return acoeff, bcoeff
 
 
@@ -977,21 +1241,16 @@ def extract_ff_params_for_seq(
 
     zipit = zip(atom_labels, residue_numbers, residue_labels)
     for atom_name, res_num, res_label in zipit:
-
         # adds C to the terminal residues
+        res = res_label
         if res_num == residue_numbers[-1]:
             res = 'C' + res_label
             was_in_C_terminal = True
             assert res.isupper() and len(res) == 4, res
-
-        elif res_num == residue_numbers[0]:
+        if res_num == residue_numbers[0]:
             res = 'N' + res_label
             was_in_N_terminal = True
             assert res.isupper() and len(res) == 4, res
-
-        else:
-            res = res_label
-
         # TODO:
         # define protonation state in parameters
         if res_label.endswith('HIS'):
@@ -1009,10 +1268,10 @@ def extract_ff_params_for_seq(
 
         params_append(float(force_field[atype][param]))
 
-    assert was_in_C_terminal, \
-        'The C terminal residue was never computed. It should have.'
-    assert was_in_N_terminal, \
-        'The N terminal residue was never computed. It should have.'
+    #assert was_in_C_terminal, \
+    #    'The C terminal residue was never computed. It should have.'
+    #assert was_in_N_terminal, \
+    #    'The N terminal residue was never computed. It should have.'
 
     assert isinstance(params_l, list)
     return params_l

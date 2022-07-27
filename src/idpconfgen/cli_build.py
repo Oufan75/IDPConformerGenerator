@@ -8,49 +8,38 @@ USAGE:
     $ idpconfgen build -db torsions.json -seq MMMMMMM...
 
 """
-import argparse
-import sys
-from functools import partial
-from itertools import cycle
-from multiprocessing import Pool, Queue
-# from numbers import Number
-#from random import choice as randchoice
-from random import randint
-from time import time
-
+#import argparse
+#from multiprocessing import Queue, Pool
+import os
 import numpy as np
-from numba import njit
 
-from idpconfgen import Path, log
-from idpconfgen.components.xmer_probs import (
-    add_xmer_arg,
-    compress_xmer_to_key,
-    prepare_xmer_probs,
-    )
-from idpconfgen.components.energy_threshold_type import add_et_type_arg
+from idpconfgen import log
+#from idpconfgen.components.energy_threshold_type import add_et_type_arg
 from idpconfgen.core.build_definitions import (
     backbone_atoms,
     build_bend_H_N_C,
     distance_C_O,
     distance_H_N,
+    bend_CA_C_O,
     forcefields,
     n_terminal_h_coords_at_origin,
     sidechain_templates,
     )
-from idpconfgen.core.exceptions import IDPConfGenException
-from idpconfgen.core import help_docs
-from idpconfgen.libs import libcli
+
+#from idpconfgen.core import help_docs
+#from idpconfgen.libs import libcli
 from idpconfgen.libs.libbuild import (
     build_regex_substitutions,
-    prepare_slice_dict,
-    read_db_to_slices_given_secondary_structure,
-    compute_sidechains,
+    #prepare_slice_dict,
+    #read_db_to_slices_given_secondary_structure,
     create_sidechains_masks_per_residue,
-    get_cycle_bond_type,
+    #get_cycle_bond_type,
+    get_cycle_bend_angles,
     get_cycle_distances_backbone,
     init_conflabels,
     init_confmasks,
     prepare_energy_function,
+    rotate_sidechain
     #read_db_to_slices,
     )
 from idpconfgen.libs.libcalc import (
@@ -59,31 +48,22 @@ from idpconfgen.libs.libcalc import (
     make_coord_Q,
     make_coord_Q_COO,
     make_coord_Q_planar,
-    make_seq_probabilities,
+    #make_seq_probabilities,
     place_sidechain_template,
     rotate_coordinates_Q_njit,
-    rrd10_njit,
-    )
-from idpconfgen.libs.libhigherlevel import bgeo_reduce
-from idpconfgen.libs.libio import (
-    make_folder_or_cwd,
-    read_dictionary_from_disk,
     )
 from idpconfgen.libs.libparse import (
     fill_list,
     get_seq_chunk_njit,
-    get_seq_next_residue_njit,
+    #get_seq_next_residue_njit,
     get_trimer_seq_njit,
-    remap_sequence,
-    remove_empty_keys,
+    #remap_sequence,
+    #remove_empty_keys,
     translate_seq_to_3l,
     )
 from idpconfgen.libs.libpdb import atom_line_formatter
-from idpconfgen.logger import S, T, init_files, pre_msg, report_on_crash
+#from idpconfgen.logger import S, T, init_files, pre_msg, report_on_crash
 
-
-_file = Path(__file__).myparents()
-LOGFILESNAME = 'idpconfgen_build'
 
 # Global variables needed to build conformers.
 # Why are global variables needed?
@@ -95,39 +75,26 @@ LOGFILESNAME = 'idpconfgen_build'
 # if __name__ == '__main__', these will be populated in main()
 # else will be populated in conformer_generator
 # populate_globals() populates these variables once called.
-BGEO_path = Path(_file, 'core', 'data', 'bgeo.tar')
-BGEO_full = {}
-BGEO_trimer = {}
-BGEO_res = {}
+#BGEO_path = Path(_file, 'core', 'data', 'dunback_bgeo.tar')
+#BGEO_full = {}
+#BGEO_trimer = {}
+#BGEO_res = {}
 
-# SLICES and ANGLES will be populated in main() with the torsion angles.
-# it is not expected SLICES or ANGLES to be populated anywhere else.
-# The slice objects from where the builder will feed to extract torsion
-# chunks from ANGLES.
-ANGLES = None
-SLICES = []
-SLICEDICT_XMERS = None
-XMERPROBS = None
-GET_ADJ = None
 
-# keeps a record of the conformer numbers written to disk across the different
-# cores
-CONF_NUMBER = Queue()
-RANDOMSEEDS = Queue()
 
-# The conformer building process needs data structures for two different
-# identities: the all-atom representation of the input sequence, and the
-# corresponding Ala/Gly/Pro template uppon which the coordinates will be built.
-# These variables are defined at the module level so they serve as global
-# variables to be read by the different process during multiprocessing. Reading
-# from global variables is performant in Python multiprocessing. This is the
-# same strategy as applied for SLICES and ANGLES.
 ALL_ATOM_LABELS = None
 ALL_ATOM_MASKS = None
 ALL_ATOM_EFUNC = None
-TEMPLATE_LABELS = None
-TEMPLATE_MASKS = None
-TEMPLATE_EFUNC = None
+
+
+
+def generate_pdb_checkpt(seq, atom_labels, res_nums, coords,
+                         nstep, dir_name):
+    pdb_string = gen_PDB_from_conformer(seq, atom_labels, res_nums, 
+                                        np.round(coords, decimals=3))
+    fname = os.path.join(dir_name, 'step_%i.pdb'%nstep)
+    with open(fname, 'w') as fout:
+        fout.write(pdb_string)
 
 
 def are_globals():
@@ -136,291 +103,17 @@ def are_globals():
         ALL_ATOM_LABELS,
         ALL_ATOM_MASKS,
         ALL_ATOM_EFUNC,
-        TEMPLATE_LABELS,
-        TEMPLATE_MASKS,
-        TEMPLATE_EFUNC,
-        BGEO_full,
-        BGEO_trimer,
-        BGEO_res,
+        #BGEO_full,
+        #BGEO_trimer,
+        #BGEO_res,
         ))
 
-
-# CLI argument parser parameters
-_name = 'build'
-_help = 'Builds conformers from database.'
-
-_prog, _des, _usage = libcli.parse_doc_params(__doc__)
-
-
-ap = libcli.CustomParser(
-    prog=_prog,
-    description=libcli.detailed.format(_des),
-    usage=_usage,
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-# https://stackoverflow.com/questions/24180527
-
-ap.add_argument(
-    '-db',
-    '--database',
-    help='The IDPConfGen database.',
-    required=True,
-    )
-
-ap.add_argument(
-    '-seq',
-    '--input_seq',
-    help='The Conformer residue sequence. String or FASTA file.',
-    required=True,
-    nargs='?',
-    action=libcli.SeqOrFasta,
-    )
-
-ap.add_argument(
-    '-nc',
-    '--nconfs',
-    help='Number of conformers to build.',
-    default=1,
-    type=int,
-    )
-
-ap.add_argument(
-    '-dr',
-    '--dssp-regexes',
-    help='Regexes used to search in DSSP',
-    default='(?=(L{2,6}))',
-    nargs='+',
-    )
-
-ap.add_argument(
-    '-dsd',
-    '--disable-sidechains',
-    help='Whether or not to compute sidechais. Defaults to True.',
-    action='store_true',
-    )
-
-_ffchoice = list(forcefields.keys())
-ap.add_argument(
-    '-ff',
-    '--forcefield',
-    help=(
-        'Forcefield parameters and atom labels. '
-        f'Defaults to {_ffchoice[0]}.'
-        ),
-    choices=_ffchoice,
-    default=_ffchoice[0],
-    )
-
-ap.add_argument(
-    '-bgeo_path',
-    '--bgeo_path',
-    help=(
-        'Path to the bond geometry database as generated by `bgeo` CLI .'
-        'Defaults to `None`, uses the internal library.'
-        ),
-    default=None,
-    )
-
-ap.add_argument(
-    '-etbb',
-    '--energy-threshold-backbone',
-    help=(
-        'The energy threshold above which chunks will be rejected '
-        'when building the BACKBONE atoms. Defaults to 10.'
-        ),
-    default=10.0,
-    type=float,
-    )
-
-ap.add_argument(
-    '-etss',
-    '--energy-threshold-sidechains',
-    help=(
-        'The energy threshold above which conformers will be rejected '
-        'after packing the sidechains (ignored if `-dsd`). '
-        'Defaults to 1000.'
-        ),
-    default=1000.0,
-    type=float,
-    )
-
-
-add_et_type_arg(ap)
-
-
-ap.add_argument(
-    '-subs',
-    '--residue-substitutions',
-    help=help_docs.residue_substitutions_cli_help,
-    default=None,
-    action=libcli.ReadDictionary,
-    )
-
-
-add_xmer_arg(ap)
-
-
-ap.add_argument(
-    '-el',
-    '--energy-log',
-    help='File where to save the energy value of each conformer.',
-    type=Path,
-    default='energies.log',
-    )
-
-
-
-
-libcli.add_argument_output_folder(ap)
-libcli.add_argument_random_seed(ap)
-libcli.add_argument_ncores(ap)
-
-
-class EnergyLogSaver:
-    """
-    Save conformer energies to a log file.
-
-    This object is intended to be used by the client only.
-    It can accommodate calls from different processors, but it is not
-    sent to the different processors, it is managed by the main()
-    function.
-    """
-    def start(self, path):
-        self.dest = open(path, 'w')
-    def save(self, confname, energy):
-        self.dest.write(f'{confname},{energy}\n')
-        self.dest.flush()
-    def close(self):
-        self.dest.close()
-
-
-ENERGYLOGSAVER = EnergyLogSaver()
-
-
-def main(
-        input_seq,
-        database,
-        dssp_regexes=r'L+',#r'(?=(L{2,6}))',
-        func=None,
-        forcefield=None,
-        bgeo_path=None,
-        residue_substitutions=None,
-        nconfs=1,
-        ncores=1,
-        random_seed=0,
-        xmer_probs=None,
-        output_folder=None,
-        energy_log='energies.log',
-        **kwargs,  # other kwargs target energy function, for example.
-        ):
-    """
-    Execute main client logic.
-
-    Distributes over processors.
-    """
-    output_folder = make_folder_or_cwd(output_folder)
-    init_files(log, Path(output_folder, LOGFILESNAME))
-    log.info(f'input sequence: {input_seq}')
-
-    # Calculates how many conformers are built per core
-    if nconfs < ncores:
-        ncores = 1
-        conformers_per_core = nconfs
-        remaining_confs = 0
-    else:
-        conformers_per_core = nconfs // ncores
-        # in case nconfs is not multiple of ncores, builds the remaining confs
-        # at the end
-        remaining_confs = nconfs % ncores
-
-    log.info(
-        f'running in {ncores} cores with '
-        f'{remaining_confs} remaining confs'
-        )
-
-    # populates globals
-    #if False:
-    #    global ANGLES, SLICES
-    #    _slices, ANGLES = read_db_to_slices(database, dssp_regexes, ncores=ncores)
-    #    SLICES.extend(_slices)
-    # #
-
-    # we use a dictionary because chunks will be evaluated to exact match
-    global ANGLES, SLICEDICT_XMERS, XMERPROBS, GET_ADJ
-    primary, ANGLES = read_db_to_slices_given_secondary_structure(database, dssp_regexes)
-
-    xmer_probs_tmp = prepare_xmer_probs(xmer_probs)
-    SLICEDICT_XMERS = prepare_slice_dict(
-        primary,
-        input_seq,
-        xmer_probs_tmp.sizes,
-        residue_substitutions,
-        )
-    remove_empty_keys(SLICEDICT_XMERS)
-    _ = compress_xmer_to_key(xmer_probs_tmp, list(SLICEDICT_XMERS.keys()))
-    XMERPROBS = _.probs
-
-    GET_ADJ = get_adjacent_angles(
-        list(SLICEDICT_XMERS.keys()),
-        XMERPROBS,
-        input_seq,
-        ANGLES,
-        SLICEDICT_XMERS,
-        residue_replacements=residue_substitutions,
-        )
-
-    populate_globals(
-        input_seq=input_seq,
-        bgeo_path=bgeo_path or BGEO_path,
-        forcefield=forcefields[forcefield],
-        **kwargs)
-
-    # create different random seeds for the different cores
-    # seeds created to the cores based on main seed are predictable
-    for i in range(ncores + bool(remaining_confs)):
-        RANDOMSEEDS.put(random_seed + i)
-
-    # creates a queue of numbers that will serve all subprocesses.
-    # Used to name the output files, conformer_1, conformer_2, ...
-    for i in range(1, nconfs + 1):
-        CONF_NUMBER.put(i)
-
-    ENERGYLOGSAVER.start(output_folder.joinpath(energy_log))
-
-    # prepars execution function
-    consume = partial(
-        _build_conformers,
-        input_seq=input_seq,  # string
-        output_folder=output_folder,
-        nconfs=conformers_per_core,  # int
-        **kwargs,
-        )
-
-    execute = partial(
-        report_on_crash,
-        consume,
-        ROC_exception=Exception,
-        ROC_folder=output_folder,
-        ROC_prefix=_name,
-        )
-
-    start = time()
-    with Pool(ncores) as pool:
-        imap = pool.imap(execute, range(ncores))
-        for _ in imap:
-            pass
-
-    if remaining_confs:
-        execute(conformers_per_core * ncores, nconfs=remaining_confs)
-
-    log.info(f'{nconfs} conformers built in {time() - start:.3f} seconds')
-    ENERGYLOGSAVER.close()
 
 
 def populate_globals(
         *,
         input_seq=None,
-        bgeo_path=BGEO_path,
+        #bgeo_path=BGEO_path,
         forcefield=None,
         **efunc_kwargs):
     """
@@ -432,7 +125,6 @@ def populate_globals(
     BGEO_trimer
     BGEO_res
     ALL_ATOM_LABELS, ALL_ATOM_MASKS, ALL_ATOM_EFUNC
-    TEMPLATE_LABELS, TEMPLATE_MASKS, TEMPLATE_EFUNC
 
     Parameters
     ----------
@@ -449,30 +141,27 @@ def populate_globals(
             f'Expected string found {type(input_seq)}'
             )
 
-    global BGEO_full, BGEO_trimer, BGEO_res
+    #global BGEO_full, BGEO_trimer, BGEO_res
 
-    BGEO_full.update(read_dictionary_from_disk(bgeo_path))
-    _1, _2 = bgeo_reduce(BGEO_full)
-    BGEO_trimer.update(_1)
-    BGEO_res.update(_2)
-    del _1, _2
-    assert BGEO_full
-    assert BGEO_trimer
-    assert BGEO_res
+    #BGEO_full.update(read_dictionary_from_disk(bgeo_path))
+    #_1, _2 = bgeo_reduce(BGEO_full)
+    #BGEO_trimer.update(_1)
+    #BGEO_res.update(_2)
+    #del _1, _2
+    #assert BGEO_full
+    #assert BGEO_trimer
+    #assert BGEO_res
     # this asserts only the first layer of keys
-    assert list(BGEO_full.keys()) == list(BGEO_trimer.keys()) == list(BGEO_res.keys())  # noqa: E501
+    #assert list(BGEO_full.keys()) == list(BGEO_trimer.keys()) == list(BGEO_res.keys())  # noqa: E501
 
     # populates the labels
     global ALL_ATOM_LABELS, ALL_ATOM_MASKS, ALL_ATOM_EFUNC
-    global TEMPLATE_LABELS, TEMPLATE_MASKS, TEMPLATE_EFUNC
 
     topobj = forcefield(add_OXT=True, add_Nterminal_H=True)
 
     ALL_ATOM_LABELS = init_conflabels(input_seq, topobj.atom_names)
-    TEMPLATE_LABELS = init_conflabels(remap_sequence(input_seq), topobj.atom_names)  # noqa: E501
 
     ALL_ATOM_MASKS = init_confmasks(ALL_ATOM_LABELS.atom_labels)
-    TEMPLATE_MASKS = init_confmasks(TEMPLATE_LABELS.atom_labels)
 
     ALL_ATOM_EFUNC = prepare_energy_function(
         ALL_ATOM_LABELS.atom_labels,
@@ -481,61 +170,10 @@ def populate_globals(
         topobj,
         **efunc_kwargs)
 
-    TEMPLATE_EFUNC = prepare_energy_function(
-        TEMPLATE_LABELS.atom_labels,
-        TEMPLATE_LABELS.res_nums,
-        TEMPLATE_LABELS.res_labels,
-        topobj,
-        **efunc_kwargs)
-
     del topobj
     return
 
 
-# private function because it depends on the global `CONF_NUMBER`
-# which is assembled in `main()`
-def _build_conformers(
-        *args,
-        input_seq=None,
-        conformer_name='conformer',
-        output_folder=None,
-        nconfs=1,
-        **kwargs,
-        ):
-    """Arrange building of conformers and saves them to PDB files."""
-    ROUND = np.round
-
-
-    # TODO: this has to be parametrized for the different HIS types
-    input_seq_3_letters = translate_seq_to_3l(input_seq)
-
-    builder = conformer_generator(
-        input_seq=input_seq,
-        random_seed=RANDOMSEEDS.get(),
-        **kwargs)
-
-    atom_labels, residue_numbers, residue_labels = next(builder)
-
-    for _ in range(nconfs):
-
-        energy, coords = next(builder)
-
-        pdb_string = gen_PDB_from_conformer(
-            input_seq_3_letters,
-            atom_labels,
-            residue_numbers,
-            ROUND(coords, decimals=3),
-            )
-
-        fname = f'{conformer_name}_{CONF_NUMBER.get()}.pdb'
-
-        with open(Path(output_folder, fname), 'w') as fout:
-            fout.write(pdb_string)
-
-        ENERGYLOGSAVER.save(fname, energy)
-
-    del builder
-    return
 
 
 # the name of this function is likely to change in the future
@@ -543,17 +181,16 @@ def conformer_generator(
         *,
         input_seq=None,
         generative_function=None,
-        disable_sidechains=True,
-        sidechain_method='faspr',
-        energy_threshold_backbone=10,
-        energy_threshold_sidechains=1000,
+        energy_threshold=100,
         bgeo_path=None,
-        forcefield=None,
+        forcefield='Amberff14SB',
         random_seed=0,
+        clash_check=True,
+        res_try_limit=10,
         **energy_funcs_kwargs,
         ):
     """
-    Build conformers.
+    Build conformers. (builds an entire residue before the next)
 
     `conformer_generator` is actually a Python generator. Examples on
     how it works:
@@ -633,17 +270,6 @@ def conformer_generator(
         executed priorly, or that ANGLES and SLICES were populated
         properly.
 
-    disable_sidechains : bool
-        Disables sidechain creation. Defaults to `False`, computes
-        sidechains.
-
-    nconfs : int
-        The number of conformers to build.
-
-    sidechain_method : str
-        The method used to build/pack sidechains over the backbone
-        structure. Defaults to `faspr`.
-        Expects a key in `libs.libbuild.compute_sidechains`.
 
     bgeo_path : str of Path
         Path to a bond geometry library as created by `bgeo` CLI.
@@ -658,23 +284,18 @@ def conformer_generator(
     """
     if not isinstance(input_seq, str):
         raise ValueError(f'`input_seq` must be given! {input_seq}')
-    if sidechain_method not in compute_sidechains:
-        raise ValueError(
-            f'{sidechain_method} not in `compute_sidechains`. '
-            f'Expected {list(compute_sidechains.keys())}.'
-            )
+    
 
-    log.info(f'random seed: {random_seed}')
-    np.random.seed(random_seed)
-    seed_report = pre_msg(f'seed {random_seed}', sep=' - ')
+    #log.info(f'random seed: {random_seed}')
+    #np.random.seed(random_seed)
+    #seed_report = pre_msg(f'seed {random_seed}', sep=' - ')
 
     # prepares protein sequences
     all_atom_input_seq = input_seq
-    template_input_seq = remap_sequence(all_atom_input_seq)
-    template_seq_3l = translate_seq_to_3l(template_input_seq)
+    all_atom_seq_3l = translate_seq_to_3l(all_atom_input_seq)
+    #print(input_seq)
     del input_seq
 
-    ANY = np.any
     BUILD_BEND_H_N_C = build_bend_H_N_C
     CALC_TORSION_ANGLES = calc_torsion_angles
     DISTANCE_NH = distance_H_N
@@ -690,31 +311,17 @@ def conformer_generator(
     PI2 = np.pi * 2
     PLACE_SIDECHAIN_TEMPLATE = place_sidechain_template
     RAD_60 = np.radians(60)
-    RC = np.random.choice
-    RINT = randint
     ROT_COORDINATES = rotate_coordinates_Q_njit
-    RRD10 = rrd10_njit
     SIDECHAIN_TEMPLATES = sidechain_templates
-    angles = ANGLES
-    slices = SLICES
-    global BGEO_full
-    global BGEO_trimer
-    global BGEO_res
+
+    #global BGEO_full
+    #global BGEO_trimer
+    #global BGEO_res
     global ALL_ATOM_LABELS
     global ALL_ATOM_MASKS
     global ALL_ATOM_EFUNC
-    global TEMPLATE_LABELS
-    global TEMPLATE_MASKS
-    global TEMPLATE_EFUNC
-    global XMERPROBS
-    global SLICEDICT_MONOMERS
-    global SLICEDICT_XMERS
-    global GET_ADJ
 
-    # these flags exist to populate the global variables in case they were not
-    # populated yet. Global variables are populated through the main() function
-    # if the script runs as CLI. Otherwise, if conformer_generator() is imported
-    # and used directly, the global variables need to be configured here.
+
     if not are_globals():
         if forcefield not in forcefields:
             raise ValueError(
@@ -723,28 +330,10 @@ def conformer_generator(
                 )
         populate_globals(
             input_seq=all_atom_input_seq,
-            bgeo_path=bgeo_path or BGEO_path,
+            #bgeo_path=bgeo_path or BGEO_path,
             forcefield=forcefields[forcefield],
             **energy_funcs_kwargs,
             )
-
-    # semantic exchange for speed al readibility
-    with_sidechains = not(disable_sidechains)
-
-    if with_sidechains:
-        build_sidechains = compute_sidechains[sidechain_method](all_atom_input_seq)  # noqa: E501
-
-    # tests generative function complies with implementation requirements
-    if generative_function:
-        try:
-            generative_function(nres=1, cres=0)
-        except Exception as err:  # this is generic Exception on purpose
-            errmsg = (
-                'The `generative_function` provided is not compatible with '
-                'the building process. Please read `build_conformers` docstring'
-                ' for more details.'
-                )
-            raise IDPConfGenException(errmsg) from err
 
     # yields atom labels
     # all conformers generated will share these labels
@@ -755,47 +344,35 @@ def conformer_generator(
         )
 
     all_atom_num_atoms = len(ALL_ATOM_LABELS.atom_labels)
-    template_num_atoms = len(TEMPLATE_LABELS.atom_labels)
 
     all_atom_coords = np.full((all_atom_num_atoms, 3), NAN, dtype=np.float64)
-    template_coords = np.full((template_num_atoms, 3), NAN, dtype=np.float64)
 
     # +2 because of the dummy coordinates required to start building.
     # see later adding dummy coordinates to the structure seed
-    bb = np.full((TEMPLATE_MASKS.bb3.size + 2, 3), NAN, dtype=np.float64)
+    bb = np.full((ALL_ATOM_MASKS.bb3.size + 2, 3), NAN, dtype=np.float64)
     bb_real = bb[2:, :]  # backbone coordinates without the dummies
 
     # coordinates for the carbonyl oxigen atoms
-    bb_CO = np.full((TEMPLATE_MASKS.COs.size, 3), NAN, dtype=np.float64)
+    bb_CO = np.full((ALL_ATOM_MASKS.COs.size, 3), NAN, dtype=np.float64)
 
     # notice that NHydrogen_mask does not see Prolines
-    bb_NH = np.full((TEMPLATE_MASKS.NHs.size, 3), NAN, dtype=np.float64)
+    bb_NH = np.full((ALL_ATOM_MASKS.NHs.size, 3), NAN, dtype=np.float64)
     bb_NH_idx = np.arange(len(bb_NH))
     # Creates masks and indexes for the `for` loop used to place NHs.
     # The first residue has no NH, prolines have no NH.
-    non_pro = np.array(list(template_input_seq)[1:]) != 'P'
+    non_pro = np.array(list(all_atom_input_seq)[1:]) != 'P'
     # NHs index numbers in bb_real
-    bb_NH_nums = np.arange(3, (len(template_input_seq) - 1) * 3 + 1, 3)[non_pro]
+    bb_NH_nums = np.arange(3, (len(all_atom_input_seq) - 1) * 3 + 1, 3)[non_pro]
     bb_NH_nums_p1 = bb_NH_nums + 1
     assert bb_NH.shape[0] == bb_NH_nums.size == bb_NH_idx.size
-
+    #print(np.sum(ALL_ATOM_LABELS.res_nums == 7))
     # sidechain masks
-    # this is sidechain agnostic, works for every sidechain, yet here we
-    # use only ALA, PRO, GLY - Mon Feb 15 17:29:20 2021
+    # this is sidechain agnostic, works for every sidechain
     ss_masks = create_sidechains_masks_per_residue(
-        TEMPLATE_LABELS.res_nums,
-        TEMPLATE_LABELS.atom_labels,
+        ALL_ATOM_LABELS.res_nums,
+        ALL_ATOM_LABELS.atom_labels,
         backbone_atoms,
         )
-    # ?
-
-    # /
-    # creates seed coordinates:
-    # because the first torsion angle of a residue is the omega, we need
-    # to prepare 2 dummy atoms to simulate the residue -1, so that the
-    # first omega can be placed. There is no need to setup specific
-    # positions, just to create a place upon which the build atom
-    # routine can create a new atom from a torsion.
     dummy_CA_m1_coord = np.array((0.0, 1.0, 1.0))
     dummy_C_m1_coord = np.array((0.0, 1.0, 0.0))
     n_terminal_N_coord = np.array((0.0, 0.0, 0.0))
@@ -806,9 +383,7 @@ def conformer_generator(
         dummy_C_m1_coord,
         n_terminal_N_coord,
         ))
-    # ?
 
-    # /
     # prepares method binding
     bbi0_register = []
     bbi0_R_APPEND = bbi0_register.append
@@ -824,29 +399,23 @@ def conformer_generator(
     res_R_APPEND = res_R.append
     res_R_POP = res_R.pop
     res_R_CLEAR = res_R.clear
-    # ?
 
-    # /
     # required inits
     broke_on_start_attempt = False
     start_attempts = 0
-    max_start_attempts = 500  # maximum attempts to start a conformer
-    # because we are building from a experimental database there can be
-    # some angle combinations that fail on our validation process from start
-    # if this happens more than `max_start_attemps` the production is canceled.
-    # ?
-
+    max_start_attempts = 10  # maximum attempts to start a conformer
     # /
     # STARTS BUILDING
-    conf_n = 1
+    conf_n = 0
     while 1:
         # prepares cycles for building process
         bond_lens = get_cycle_distances_backbone()
-        bond_type = get_cycle_bond_type()
+        #bond_type = get_cycle_bond_type()
+        bend_angle = get_cycle_bend_angles()
 
         # in the first run of the loop this is unnecessary, but is better to
         # just do it once than flag it the whole time
-        template_coords[:, :] = NAN
+        all_atom_coords[:, :] = NAN
         bb[:, :] = NAN
         bb_CO[:, :] = NAN
         bb_NH[:, :] = NAN
@@ -871,120 +440,89 @@ def conformer_generator(
         res_R_APPEND(current_res_number)
 
         backbone_done = False
+        same_res_try = 0
         number_of_trials = 0
         # TODO: use or not to use number_of_trials2? To evaluate in future.
         number_of_trials2 = 0
         number_of_trials3 = 0
+        nstep = 0
         # run this loop until a specific BREAK is triggered
         while 1:  # 1 is faster than True :-)
-            #print(bbi)
-
-            # I decided to use an if-statement here instead of polymorph
-            # the else clause to a `generative_function` variable because
-            # the resulting overhead from the extra function call and
-            # **kwargs handling was greater then the if-statement processing
-            # https://pythonicthoughtssnippets.github.io/2020/10/21/PTS14-quick-in-if-vs-polymorphism.html
-            if generative_function:
+            nstep += 1
+            if same_res_try == 0:
                 agls = generative_function(
-                    nres=RINT(1, 6),
-                    cres=calc_residue_num_from_index(bbi)
+                    cres = calc_residue_num_from_index(bbi)
                     )
-
+                agl_stored = agls.copy()
+                #print(np.degrees(agl_stored[:3]))
             else:
-                # following `aligndb` function,
-                # `angls` will always be cyclic with:
-                # omega - phi - psi - omega - phi - psi - (...)
-                #agls = angles[RC(slices), :].ravel()
-                # agls = angles[:, :].ravel()
-
-                #primer_template = get_idx_primer_njit(
-                #    all_atom_input_seq,
-                #    RC(slices_dict_keys, p=XMERPROBS),
-                #    calc_residue_num_from_index(bbi - 1),
-                #    )
-
-                # algorithm for adjacent building
-                # TODO
-                # primer_template here is used temporarily, and needs to be
-                # removed when get_adj becomes an option
-                primer_template, agls = GET_ADJ(bbi - 1)
-
-            # index at the start of the current cycle
-            PRIMER = cycle(primer_template)
+                agls = agl_stored + np.random.uniform(np.radians(-3), np.radians(3), len(agls))
+                for n in range(len(agls)):
+                    if agls[n] > np.pi: agls[n] -= 2*np.pi
+                    elif agls[n] < -np.pi: agls[n] += 2*np.pi
+                #print(np.degrees(agls[:3]))  
             try:
-                for (omg, phi, psi) in zip(agls[0::3], agls[1::3], agls[2::3]):
-
-                    current_res_number = calc_residue_num_from_index(bbi - 1)
-
-                    # assert the residue being built is of the same nature as the one in the angles
-                    # TODO: remove this assert
-                    n_ = next(PRIMER)
-                    assert all_atom_input_seq[current_res_number] == n_, (all_atom_input_seq[current_res_number], n_)
-
-                    curr_res, tpair = GET_TRIMER_SEQ(
+                current_res_number = calc_residue_num_from_index(bbi - 1) # bbi - 1 = 0 atom Ca
+                curr_res, tpair = GET_TRIMER_SEQ(
                         all_atom_input_seq,
                         current_res_number,
                         )
-                    torpair = f'{RRD10(phi)},{RRD10(psi)}'
+                #print('resnum:', current_res_number)
+                for torsion_angle in (agls[0], agls[1], agls[2]): 
 
-                    for torsion_angle in (omg, phi, psi):
+                    #_bt = next(bond_type)
+                    
+                    #try:
+                    #    _bend_angle = RC(BGEO_full[_bt][curr_res][tpair][torpair])  # noqa: E501
+                    #except KeyError:
+                    #    try:
+                    #        _bend_angle = RC(BGEO_trimer[_bt][curr_res][tpair])  # noqa: E501
+                    #    except KeyError:
+                    #        _bend_angle = RC(BGEO_res[_bt][curr_res])
+                    _bend_angle = next(bend_angle)[curr_res]
+                    #_bend_angle = np.random.normal(_bend_stats[0], _bend_stats[1])
 
-                        _bt = next(bond_type)
-
-                        try:
-                            _bend_angle = RC(BGEO_full[_bt][curr_res][tpair][torpair])  # noqa: E501
-                        except KeyError:
-                            try:
-                                _bend_angle = RC(BGEO_trimer[_bt][curr_res][tpair])  # noqa: E501
-                            except KeyError:
-                                _bend_angle = RC(BGEO_res[_bt][curr_res])
-
-                        _bond_lens = next(bond_lens)[curr_res]
-
-                        bb_real[bbi, :] = MAKE_COORD_Q_LOCAL(
-                            bb[bbi - 1, :],
-                            bb[bbi, :],
-                            bb[bbi + 1, :],
-                            _bond_lens,
-                            _bend_angle,
-                            torsion_angle,
-                            )
-                        bbi += 1
-
-                    try:
-                        co_bend = RC(BGEO_full['Ca_C_O'][curr_res][tpair][torpair])  # noqa: E501
-                    except KeyError:
-                        try:
-                            co_bend = RC(BGEO_trimer['Ca_C_O'][curr_res][tpair])
-                        except KeyError:
-                            co_bend = RC(BGEO_res['Ca_C_O'][curr_res])
-
-                    bb_CO[COi, :] = MAKE_COORD_Q_PLANAR(
-                        bb_real[bbi - 3, :],
-                        bb_real[bbi - 2, :],
-                        bb_real[bbi - 1, :],
-                        distance=DISTANCE_C_O,
-                        bend=co_bend
+                    _bond_lens = next(bond_lens)[curr_res] + np.random.normal(0., 0.01)
+                    #_bond_lens = np.random.normal(_bond_stats[0], _bond_stats[1])
+                    
+                    bb_real[bbi, :] = MAKE_COORD_Q_LOCAL(
+                        bb[bbi - 1, :],
+                        bb[bbi, :],
+                        bb[bbi + 1, :],
+                        _bond_lens,
+                        _bend_angle,
+                        torsion_angle,
                         )
-                    COi += 1
+                    bbi += 1
+
+                #try:
+                #    co_bend = RC(BGEO_full['Ca_C_O'][curr_res][tpair][torpair])  # noqa: E501
+                #except KeyError:
+                #    try:
+                #        co_bend = RC(BGEO_trimer['Ca_C_O'][curr_res][tpair])
+                #    except KeyError:
+                #        co_bend = RC(BGEO_res['Ca_C_O'][curr_res])
+                _co_bend_stats = bend_CA_C_O[curr_res]
+                co_bend = np.random.normal(_co_bend_stats[0], _co_bend_stats[1])
+
+                bb_CO[COi, :] = MAKE_COORD_Q_PLANAR(
+                    bb_real[bbi - 3, :],
+                    bb_real[bbi - 2, :],
+                    bb_real[bbi - 1, :],
+                    distance=DISTANCE_C_O,
+                    bend=co_bend
+                    )
+                COi += 1
 
             except IndexError:
-                # IndexError happens when the backbone is complete
-                # in this protocol the last atom build was a carbonyl C
-                # bbi is the last index of bb + 1, and the last index of
-                # bb_real + 2
-
                 # activate flag to finish loop at the end
                 backbone_done = True
 
                 # add the carboxyls
-                template_coords[TEMPLATE_MASKS.cterm] = \
+                all_atom_coords[ALL_ATOM_MASKS.cterm] = \
                     MAKE_COORD_Q_COO_LOCAL(bb[-2, :], bb[-1, :])
 
             # Adds N-H Hydrogens
-            # Not a perfect loop. It repeats for Hs already placed.
-            # However, was a simpler solution than matching the indexes
-            # and the time cost is not a bottle neck.
             _ = ~ISNAN(bb_real[bb_NH_nums_p1, 0])
             for k, j in zip(bb_NH_nums[_], bb_NH_idx[_]):
 
@@ -995,47 +533,49 @@ def conformer_generator(
                     distance=DISTANCE_NH,
                     bend=BUILD_BEND_H_N_C,
                     )
-
-            # Adds sidechain template structures
-            for res_i in range(res_R[-1], current_res_number + 1):  # noqa: E501
-
-                _sstemplate, _sidechain_idxs = \
-                    SIDECHAIN_TEMPLATES[template_seq_3l[res_i]]
-
-                sscoords = PLACE_SIDECHAIN_TEMPLATE(
-                    bb_real[res_i * 3:res_i * 3 + 3, :],  # from N to C
+                
+            res_type = all_atom_seq_3l[current_res_number]
+            #res_type_1l = all_atom_input_seq[current_res_number]
+            _sstemplate, _sidechain_idxs = SIDECHAIN_TEMPLATES[res_type]
+            
+            # make false for testing backbones
+            if res_type not in ['ALA', 'GLY']:
+                _sstemplate, _sidechain_idxs = rotate_sidechain(res_type, agls[3:])
+                
+            # Adds sidechain template structures        
+            sscoords = PLACE_SIDECHAIN_TEMPLATE(
+                    bb_real[current_res_number * 3:current_res_number* 3 + 3, :],  # from N to C
                     _sstemplate,
                     )
-
-                ss_masks[res_i][1][:, :] = sscoords[_sidechain_idxs]
-
+            #print('res:', res_type, current_res_number + 1)
+            ss_masks[current_res_number][1][:, :] = sscoords[_sidechain_idxs]
+            
+            
             # Transfers coords to the main coord array
             for _smask, _sidecoords in ss_masks[:current_res_number + 1]:
-                template_coords[_smask] = _sidecoords
+                all_atom_coords[_smask] = _sidecoords
 
             # / Place coordinates for energy calculation
             #
             # use `bb_real` to do not consider the initial dummy atom
-            template_coords[TEMPLATE_MASKS.bb3] = bb_real
-            template_coords[TEMPLATE_MASKS.COs] = bb_CO
-            template_coords[TEMPLATE_MASKS.NHs] = bb_NH
+            all_atom_coords[ALL_ATOM_MASKS.bb3] = bb_real
+            all_atom_coords[ALL_ATOM_MASKS.COs] = bb_CO
+            all_atom_coords[ALL_ATOM_MASKS.NHs] = bb_NH
 
             if len(bbi0_register) == 1:
                 # places the N-terminal Hs only if it is the first
                 # chunk being built
                 _ = PLACE_SIDECHAIN_TEMPLATE(bb_real[0:3, :], N_TERMINAL_H)
-                template_coords[TEMPLATE_MASKS.Hterm, :] = _[3:, :]
-                current_Hterm_coords = _[3:, :]
+                all_atom_coords[ALL_ATOM_MASKS.Hterm, :] = _[3:, :]
                 del _
 
-                if template_input_seq[0] != 'G':
+                if all_atom_input_seq[0] != 'G':
                     # rotates only if the first residue is not an
                     # alanie
 
                     # measure torsion angle reference H1 - HA
                     _h1_ha_angle = CALC_TORSION_ANGLES(
-                        template_coords[TEMPLATE_MASKS.H1_N_CA_CB, :]
-                        )[0]
+                        all_atom_coords[ALL_ATOM_MASKS.H1_N_CA_CB, :])[0]
 
                     # given any angle calculated along an axis, calculate how
                     # much to rotate along that axis to place the
@@ -1043,50 +583,56 @@ def conformer_generator(
                     _rot_angle = _h1_ha_angle % PI2 - RAD_60
 
                     current_Hterm_coords = ROT_COORDINATES(
-                        template_coords[TEMPLATE_MASKS.Hterm, :],
-                        template_coords[1] / NORM(template_coords[1]),
+                        all_atom_coords[ALL_ATOM_MASKS.Hterm, :],
+                        all_atom_coords[1] / NORM(all_atom_coords[1]),
                         _rot_angle,
                         )
+                    all_atom_coords[ALL_ATOM_MASKS.Hterm, :] = current_Hterm_coords
 
-                    template_coords[TEMPLATE_MASKS.Hterm, :] = current_Hterm_coords  # noqa: E501
-            # ?
-
-            total_energy = TEMPLATE_EFUNC(template_coords)
-
-            if ANY(total_energy > energy_threshold_backbone):
-                #print('---------- energy positive')
-                # reset coordinates to the original value
-                # before the last chunk added
-
-                # reset the same chunk maximum 5 times,
-                # after that reset also the chunk before
+            # TODO:mark last built atom to avoid recalculating old energies
+            if energy_threshold: total_energy = ALL_ATOM_EFUNC(all_atom_coords)
+            # pdb checkpoints
+            if False:
+                res_idx = np.argwhere(ALL_ATOM_LABELS.res_nums == current_res_number + 1).max()
+                pdb_checkpoint(all_atom_seq_3l[:current_res_number+1],
+                               ALL_ATOM_LABELS.atom_labels[:res_idx+1],
+                               ALL_ATOM_LABELS.res_nums[:res_idx+1],
+                               all_atom_coords[:res_idx+1],
+                               nstep, dirname='torsions/alpha_syn/rebuilds_checkpt')
+            
+            
+            if energy_threshold and np.any(total_energy>energy_threshold):
+                #if nstep > 2000: return #for rebuilding conformers
                 try:
-                    if number_of_trials > 30:
-                        bbi0_R_POP()
-                        COi0_R_POP()
-                        res_R_POP()
-                        number_of_trials = 0
-                        number_of_trials2 += 1
-
-                    if number_of_trials2 > 5:
-                        bbi0_R_POP()
-                        COi0_R_POP()
-                        res_R_POP()
-                        number_of_trials2 = 0
-                        number_of_trials3 += 1
-
-                    if number_of_trials3 > 5:
-                        bbi0_R_POP()
-                        COi0_R_POP()
-                        res_R_POP()
-                        number_of_trials3 = 0
+                    if same_res_try < res_try_limit:
+                        same_res_try += 1
+                    else:
+                        number_of_trials += 1
+                        same_res_try = 0
+                        if number_of_trials > 4:
+                            bbi0_R_POP()
+                            COi0_R_POP()
+                            res_R_POP()
+                            number_of_trials = 0
+                            number_of_trials2 += 1
+    
+                        if number_of_trials2 > 2:
+                            bbi0_R_POP()
+                            COi0_R_POP()
+                            res_R_POP()
+                            number_of_trials2 = 0
+                            number_of_trials3 += 1
+    
+                        if number_of_trials3 > 2:
+                            bbi0_R_POP()
+                            COi0_R_POP()
+                            res_R_POP()
+                            number_of_trials3 = 0
 
                     _bbi0 = bbi0_register[-1]
                     _COi0 = COi0_register[-1]
                     _resi0 = res_R[-1]
                 except IndexError:
-                    # if this point is reached,
-                    # we erased until the beginning of the conformer
                     # discard conformer, something went really wrong
                     broke_on_start_attempt = True
                     break  # conformer while loop, starts conformer from scratch
@@ -1102,23 +648,25 @@ def conformer_generator(
 
                 # coords needs to be reset because size of protein next
                 # chunks may not be equal
-                template_coords[:, :] = NAN
-                template_coords[TEMPLATE_MASKS.Hterm, :] = current_Hterm_coords
+                for _mask, _coords in ss_masks:
+                    all_atom_coords[_mask, :] = NAN
+                all_atom_coords[ALL_ATOM_MASKS.NHs, :] = NAN
 
                 # prepares cycles for building process
                 # this is required because the last chunk created may have been
                 # the final part of the conformer
                 if backbone_done:
                     bond_lens = get_cycle_distances_backbone()
-                    bond_type = get_cycle_bond_type()
+                    #bond_type = get_cycle_bond_type()
 
                 # we do not know if the next chunk will finish the protein
                 # or not
                 backbone_done = False
-                number_of_trials += 1
                 continue  # send back to the CHUNK while loop
 
             # if the conformer is valid
+            #print(np.degrees(agls[:3]))
+            same_res_try = 0
             number_of_trials = 0
             bbi0_R_APPEND(bbi)
             COi0_R_APPEND(COi)
@@ -1133,7 +681,7 @@ def conformer_generator(
         if broke_on_start_attempt:
             start_attempts += 1
             if start_attempts > max_start_attempts:
-                log.error(
+                print(
                     'Reached maximum amount of re-starts. Canceling... '
                     f'Built a total of {conf_n} conformers.'
                     )
@@ -1141,34 +689,8 @@ def conformer_generator(
             broke_on_start_attempt = False
             continue  # send back to the CHUNK while loop
 
-        # we do not want sidechains at this point
-        all_atom_coords[ALL_ATOM_MASKS.bb4] = template_coords[TEMPLATE_MASKS.bb4]  # noqa: E501
-        all_atom_coords[ALL_ATOM_MASKS.NHs] = template_coords[TEMPLATE_MASKS.NHs]  # noqa: E501
-        all_atom_coords[ALL_ATOM_MASKS.Hterm] = template_coords[TEMPLATE_MASKS.Hterm]  # noqa: E501
-        all_atom_coords[ALL_ATOM_MASKS.cterm, :] = template_coords[TEMPLATE_MASKS.cterm, :]  # noqa: E501
-
-        if with_sidechains:
-
-            all_atom_coords[ALL_ATOM_MASKS.non_Hs_non_OXT] = build_sidechains(
-                template_coords[TEMPLATE_MASKS.bb4],
-                )
-
-            total_energy = ALL_ATOM_EFUNC(all_atom_coords)
-
-            if ANY(total_energy > energy_threshold_sidechains):
-                _msg = (
-                    'Conformer with energy higher than allowed threshold '
-                    '- discarded.'
-                    )
-                log.info(seed_report(_msg))
-                continue
-
-        _total_energy = np.nansum(total_energy)
-        _msg = f'finished conf: {conf_n} with energy {_total_energy}'
-        log.info(seed_report(_msg))
-
-        #print(all_atom_coords)
-        yield total_energy, all_atom_coords
+        start_attempts = 0
+        yield all_atom_coords
         conf_n += 1
 
 
@@ -1264,6 +786,7 @@ def get_adjacent_angles(
     """
     residue_replacements = residue_replacements or {}
     probs = fill_list(probs, 0, len(options))
+    
 
     def func(aidx):
 
@@ -1316,7 +839,15 @@ def get_adjacent_angles(
     return func
 
 
+def pdb_checkpoint(seq, atom_labels, res_nums, coords,
+                   nstep, dirname):
+    pdb_string = gen_PDB_from_conformer(seq, atom_labels,
+                                        res_nums,
+                                        np.round(coords, decimals=3))
+    fname = os.path.join(dirname, 'step_%i.pdb'%nstep)
+    with open(fname, 'w') as fout:
+        fout.write(pdb_string)
 
 
-if __name__ == "__main__":
-    libcli.maincli(ap, main)
+#if __name__ == "__main__":
+#    libcli.maincli(ap, main)

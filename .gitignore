@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# test files
+src/idpconfgen/cli_build_old.py
+src/idpconfgen/drk_bond_len.py
+
 # vim and project files
 *.swp
 *.vim

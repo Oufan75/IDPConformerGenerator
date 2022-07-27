@@ -20,6 +20,58 @@ AXIS_111 = np.array([
     [0.0, 0.0, 1.0],
     ])
 
+def M(axis, theta):
+    """Create rotation matrix with angle theta around a given axis.
+    From https://stackoverflow.com/questions/6802577/rotation-of-3d-vector.
+    """
+    axis = axis / np.sqrt(np.dot(axis, axis))
+    a = np.cos(theta / 2.0)
+    b, c, d = -axis * np.sin(theta / 2.0)
+    aa, bb, cc, dd = a * a, b * b, c * c, d * d
+    bc, ad, ac, ab, bd, cd = b * c, a * d, a * c, a * b, b * d, c * d
+    return np.array([[aa + bb - cc - dd, 2 * (bc + ad), 2 * (bd - ac)],
+                     [2 * (bc - ad), aa + cc - bb - dd, 2 * (cd + ab)],
+                     [2 * (bd + ac), 2 * (cd - ab), aa + dd - bb - cc]])
+
+def scale(vector, target_len):
+    """Scale a vector to match a given target length."""
+    v_len = np.linalg.norm(vector)
+    return vector / v_len * target_len
+
+def get_methylene_hydrogens(r1, carbon, r2):
+    """Place methylene hydrogens (R1-CH2-R2) on central Carbon.
+    From https://github.com/jonathanking/sidechainnet/structure/HydrogenBuilder
+    Args:
+        r1: First atom vector.
+        carbon: Second atom vector (Carbon needing hydrogens).
+        r2: Third atom vector.
+    Returns:
+        Tuple: Hydrogens extending from central Carbon.
+    """
+    METHYLENE_ANGLE = np.rad2deg(0.61656)
+    METHYLENE_LEN = 1.09
+        
+    # Define local vectors
+    R1 = r1 - carbon
+    R2 = r2 - carbon
+
+    # Create perpendicular vector
+    PV = np.cross(R1, R2)
+    axis = R2 - R1
+
+    # Place first hydrogen
+    R = M(axis, METHYLENE_ANGLE)
+    H1 = np.dot(R, PV)
+    H1 = scale(vector=H1, target_len=METHYLENE_LEN)
+
+    # Place second hydrogen
+    R = M(axis, -METHYLENE_ANGLE)
+    H2 = np.dot(R, -PV)
+    H2 = scale(vector=H2, target_len=METHYLENE_LEN)
+
+    # Return to original position
+    return [H1+carbon, H2+carbon]
+
 
 def make_axis_vectors(A, B, C):
     """
@@ -728,7 +780,7 @@ def calc_all_vs_all_dists_square(coords):
 
 
 # njit available
-def calc_all_vs_all_dists(coords):
+def calc_all_vs_all_dists(coords, c=1):
     """
     Calculate the upper half of all vs. all distances.
 
@@ -743,10 +795,9 @@ def calc_all_vs_all_dists(coords):
     np.ndarray, shape ((N * N - N) // 2,), dytpe=np.float64
     """
     len_ = coords.shape[0]
-    shape = ((len_ * len_ - len_) // 2,)
+    shape = (len_**2 - len_)//2 - (c**2 - c)//2
     results = np.empty(shape, dtype=np.float64)
 
-    c = 1
     i = 0
     for a in coords:
         for b in coords[c:]:
@@ -759,51 +810,6 @@ def calc_all_vs_all_dists(coords):
 
     return results
 
-
-# def calc_vdW_AB(sigma_i, sigma_j, eps_i, eps_j, alpha=0.8):
-#     """
-#     non vectorized
-#     """
-#     rminA = (2 * sigma_i)**(1/6)
-#     rminB = (2 * sigma_j)**(1/6)
-#     rmin_pair = alpha * (rminA + rminB)
-#     eps_pair = (eps_i * atomB_j)**0.5
-#     A = eps_pair * rmin_pair**12
-#     B = 2 * eps_pair * rmin_pair**6
-#     return A, B
-
-
-# def calc_Coulomb_ij(qi, qj, rij):
-#     return qi * qj / rij
-
-
-# def calc_all_Coulom(partial_charges, r_pairs, ep=4):
-#     """
-#     al implementar rever que no se computa contra si mismo
-#     i < j
-#
-#     Where ep is the dieletric constant
-#     """
-#     coulombs = partial_charges[1:] * partial_charges[:-1]
-#     coef = coulombs / r_pairs
-#     energy_pair = coef / ep
-#     return sum(energy_pair)
-
-
-# def calc_FGB(
-#         const=-0.5 * (1 / 4 - 1 / 80),
-#         ):
-#     """."""
-#
-#     coulombs = partial_charges[1:] * partial_charges[:-1]
-#     return const * sum(qi*qj/fGB(rij) for i in range(1))  #complete
-#
-#
-# def calc_fGB():
-#     """."""
-#     rij2 = rij**2
-#     (rij2+Ri*Rj*math.exp(-rij2/4*Ri*Rj))**0.5
-#     return
 
 
 @njit
@@ -890,7 +896,6 @@ def sum_upper_diagonal_raw(data, result):
     Parameters
     ----------
     data : an interable of Numbers, of length N
-
     result : a mutable sequence, either list of np.ndarray,
              of length N*(N-1)//2
     """

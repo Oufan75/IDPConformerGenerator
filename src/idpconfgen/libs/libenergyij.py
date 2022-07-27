@@ -125,7 +125,7 @@ def init_coulomb_calculator(charges_ij, postf=default_post_calc_option):
     return options[postf]
 
 
-def energycalculator_ij(distf, efuncs):
+def energycalculator_ij(distf, efuncs, check_clash=False, vdw_radii_sum=None):
     """
     Calculate the sum of energy terms.
 
@@ -173,8 +173,30 @@ def energycalculator_ij(distf, efuncs):
     """
     def calculate(coords):
         dist_ij = distf(coords)
-        energy = 0
+        energy = 0.
+        #remove calculated energy params
+        #idx = np.arange(len(coords)*(len(coords)-1)//2)
+        #if prev > 0:
+        #    tri = upper_tri_idx(prev, len(coords))
+        #    idx = np.delete(idx, tri)
+        if check_clash:
+            if (dist_ij < vdw_radii_sum).any():
+                return np.inf
         for func in efuncs:
             energy += func(dist_ij)
         return energy
     return calculate
+
+
+# === helper functions ===
+def upper_tri_idx(old, boxlen):
+    # returns idx for calculated energies, the left triangles of length old
+    # idx ordered by row
+    tri = []
+    st = 0
+    for n in range(old):
+        tri += list(np.arange(st, st+old-n))
+        boxlen -= 1
+        st += boxlen
+        
+    return tri 
